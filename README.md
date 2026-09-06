@@ -1,195 +1,220 @@
-# Swarm — Claude orchestrating Cursor + CommandCode
+# Swarm — Claude orchestrating Cursor (+ CommandCode fallback)
 
-A Claude Code skill that turns Claude into a senior-engineer orchestrator over
-two local coding workers: **Cursor Agent** (Grok 4.6 Medium) and
-**CommandCode** (`poolside/laguna-s-2.1-free`). Single-worker by default —
-Claude picks one per task, not both. Works in any repo — it's installed
-globally.
+A Claude Code skill that turns Claude into a senior-engineer orchestrator over a
+local coding worker. **Cursor Agent is the default worker**; **CommandCode** is
+the fallback for when Cursor is missing, failing, or you explicitly ask for it.
+One worker per task — this is deliberately not a parallel-everything setup.
+Works in any repo; it's installed globally.
 
 ## 1. Architecture
 
 ```
 YOU
  ↓
-CLAUDE CODE — plans, picks ONE worker, reviews the real diff, decides
+CLAUDE CODE — preflights, scopes, picks ONE worker, reviews the real diff, decides
  ↓
- ├── Cursor Agent (cursor-grok-4.6-medium)     — default primary
- └── CommandCode (poolside/laguna-s-2.1-free)  — alternate / on-demand 2nd opinion
+ ├── Cursor Agent    — default worker
+ └── CommandCode     — fallback / on-demand second opinion
  ↓
 Claude inspects git diff + runs verification (never trusts the worker's report)
  ↓
-PASS → commit + merge (Claude's own commit, no tool attribution)
+PASS → commit + merge (your git identity, no tool attribution)
 MINOR FIX → Claude fixes it · MAJOR FIX → back to the worker
 ARCHITECTURAL ISSUE / big decision → stops and asks you
 ```
 
-Only one worker runs per task by default. A second worker is only brought in
-when the first diff's review is genuinely inconclusive — not automatically in
-parallel. Each worker gets its own **git worktree** so it never writes to your
-real working tree directly; Claude only merges in a worktree's changes after
-review passes.
+Each worker gets its own **git worktree**, so it never writes to your real
+working tree; Claude merges a worktree in only after review passes.
 
-Everything lives in `~/.claude/skills/swarm/`:
 ```
-SKILL.md              orchestration protocol Claude follows
+SKILL.md                    orchestration protocol Claude follows
 scripts/
-  cursor-task.sh         headless call to cursor-agent
-  commandcode-task.sh    headless call to commandcode
-  new-worktree.sh        creates an isolated worktree for a worker
-  cleanup-worktree.sh    removes a worktree + branch after integration
-templates/task-prompt.md  structured delegation template
+  preflight.sh                one-call repo/worker state check before delegating
+  cursor-task.sh              headless call to cursor-agent (default worker)
+  commandcode-task.sh         headless call to commandcode (fallback)
+  new-worktree.sh             creates an isolated worktree for a worker
+  cleanup-worktree.sh         removes a worktree + branch after integration
+templates/task-prompt.md    structured delegation template
 ```
 
-## 2. How Claude invokes Cursor
+## 2. Lifecycle
+
+1. **Preflight** — `preflight.sh <repo>` reports branch, HEAD, uncommitted
+   changes, stale swarm worktrees, and whether each worker CLI is installed. A
+   dirty working tree is flagged and raised with you before anything runs: the
+   worker branches from HEAD and can't see uncommitted work, and the later merge
+   can fail on overlap.
+2. **Baseline** — verification commands run once on the base commit, which both
+   proves the commands actually work and records tests that were *already* red.
+   Those go into the task prompt as "not yours to fix", so correction cycles
+   aren't wasted on pre-existing failures.
+3. **Worktree** — isolated branch for the worker.
+4. **Delegate** — one worker, one structured prompt.
+5. **Review** — Claude reads the real diff (fast lane or full lane), runs
+   verification *inside the worktree*, compares against the baseline and against
+   the worker's own report.
+6. **Integrate** — commit + `merge --no-ff` + cleanup, or hand back for correction.
+
+## 3. How Claude invokes the workers
 
 ```bash
-scripts/cursor-task.sh <worktree-dir> <prompt-file> <output.json>
-```
-which runs:
-```bash
-cursor-agent -p --model cursor-grok-4.6-medium --output-format json --force \
-  --workspace <worktree-dir> "$(cat <prompt-file>)"
-```
-`-p` is headless/scriptable mode with full file/shell tool access. `--force`
-auto-approves tool calls (safe here because it's confined to a throwaway
-worktree, not your real working tree). Output is a single JSON object; the
-final answer is in its `result` field. Typically 5-20s for a small task.
-
-## 3. How Claude invokes CommandCode
-
-```bash
+scripts/cursor-task.sh      <worktree-dir> <prompt-file> <output.json>
 scripts/commandcode-task.sh <worktree-dir> <prompt-file> <output.json>
 ```
-which runs:
+
+Both are headless, auto-approve tool calls *inside the throwaway worktree*
+(`--force` for Cursor, `--yolo` for CommandCode), and enforce their own timeout.
+
+- **Cursor**: `cursor-agent -p --model <id> --output-format json --force
+  --workspace <dir>`. Returns one JSON object; final answer in `result`.
+  Typically 5–20s on a small task.
+- **CommandCode**: `cd <dir> && commandcode -p <prompt> -m <id> --output-format
+  json --yolo --skip-onboarding --no-session`. It has no `--workspace` flag, so
+  the wrapper `cd`s in (`--add-dir` only *widens* context rather than setting the
+  primary workspace). `--no-session` keeps these ephemeral subtasks out of your
+  real CommandCode history. Returns an NDJSON event stream plus a final line.
+
+**Timeouts.** Default 900s, overridable with `SWARM_TASK_TIMEOUT=<seconds>`.
+macOS has no coreutils `timeout`, so the wrappers poll and escalate TERM → KILL
+themselves. A timeout exits `124` and leaves any partial work in the worktree —
+Claude checks for it and either continues from that state or resets, per
+[SKILL.md](SKILL.md) §6. Exit codes: `0` ok · `124` timeout · `127` not
+installed · `2` bad arguments · anything else is the worker's own failure.
+
+## 4. Model selection
+
+Model IDs are **pinned in the scripts, not in the protocol** — `SKILL.md`
+deliberately says only "Cursor" and "CommandCode" so it doesn't drift as model
+names change. To see or change them, edit the defaults in `scripts/*.sh`, or
+override per-invocation:
+
 ```bash
-cd <worktree-dir> && commandcode -p "$(cat <prompt-file>)" \
-  -m poolside/laguna-s-2.1-free --output-format json --yolo \
-  --skip-onboarding --no-session
+CURSOR_SWARM_MODEL=<id>       # list options: cursor-agent --list-models
+COMMANDCODE_SWARM_MODEL=<id>  # list options: commandcode --list-models
 ```
-CommandCode has no `--workspace` flag (unlike `cursor-agent`), so the wrapper
-`cd`s into the worktree instead of using `--add-dir` (which only *widens*
-context rather than setting the primary workspace). `--yolo` auto-approves
-tool calls inside that worktree. `--skip-onboarding` avoids an interactive
-prompt on automated runs. `--no-session` keeps these ephemeral delegated
-subtasks out of your real CommandCode session history. Output is an NDJSON
-event stream plus a final result line.
 
-## 4. How Grok 4.6 (not fast) is selected for Cursor
+Current defaults are Cursor's Grok 4.6 Medium tier (`-low`/`-high`/`-xhigh`
+variants also exist) and a free-tier CommandCode model. The free tier is chosen
+for zero cost and comes with variable latency and occasional unavailability —
+see troubleshooting.
 
-The model id is pinned as `cursor-grok-4.6-medium` (confirmed via
-`cursor-agent --list-models` — this is the "Cursor Grok 4.6 Medium" entry, not
-one of the `-fast` variants). Override per-invocation with
-`CURSOR_SWARM_MODEL=<id>` if you want a different reasoning tier (`-low`,
-`-high`, `-xhigh` also exist).
+## 5. Approval gates
 
-## 5. How the CommandCode model is selected
-
-Pinned as `poolside/laguna-s-2.1-free` — free, open-weight, agentic coding,
-confirmed via `commandcode --list-models`. This is a free-tier model, same
-risk category that caused friction with OpenCode earlier (see troubleshooting
-below) — chosen anyway for zero cost. Override with
-`COMMANDCODE_SWARM_MODEL=<model-id>` (e.g. `deepseek/deepseek-v4-flash`,
-`moonshotai/kimi-k2.7-code`, `zai-org/glm-5.2` — run
-`commandcode --list-models` for the full, current catalog; most non-free
-options route through your CommandCode account billing).
-
-## 6. Approval gates
-
-Claude proceeds on its own for: inspecting files/diffs, running tests/lint/type
-checks, delegating reasonably-scoped tasks, reviewing worker output, small fixes,
-normal iterative debugging, and merging a passing worktree's changes locally.
+Claude proceeds on its own for: preflight and inspection, running
+tests/lint/type checks, delegating reasonably-scoped tasks, reviewing worker
+output, small fixes, iterative debugging, and merging a passing worktree locally.
 
 Claude stops and asks first for: large refactors, architectural changes, DB
-migrations, deleting substantial code, public API changes, auth/security
-changes, new dependencies, deployment, destructive commands, anything touching
-data outside the repo, fanning out to more than one worker, pushing/opening a
-PR, or a task that's already burned 2 correction cycles without resolving.
-Full list and exact wording is in [SKILL.md](SKILL.md) §2 — edit that section
+migrations, deleting substantial code, **breaking** public API changes (adding to
+an API is fine), auth/security changes, new dependencies, deployment, destructive
+commands, data outside the repo, fanning out to more than one worker, pushing or
+opening a PR, running at all in a **non-git directory**, or a task that's already
+burned 2 correction cycles. Exact wording is [SKILL.md](SKILL.md) §3 — edit that
 to change the gate.
 
-## 7. Token/cost safeguards
+## 6. Token/cost safeguards
 
-- **Single worker by default** — Cursor or CommandCode, never both up front. A
-  second worker only gets involved if the first one's review is genuinely
-  inconclusive, capped at one secondary worker per task.
-- **Two review lanes** — a small, well-scoped diff gets a quick diff-read +
-  verification-run; only a bigger or higher-risk diff gets a full
-  architectural/security pass. Most delegated tasks should hit the fast lane.
-- Max **2 correction cycles** per worker per task before Claude stops and
-  reports the failure instead of retrying indefinitely.
-- Claude never spawns its own subagent (Task/Explore/etc.) on top of a
-  delegated task — Cursor/CommandCode already are the workers.
-- Trivial requests (typos, one-liners) bypass the whole pipeline — Claude just
-  does them.
+- **One worker by default.** A second is brought in only when review is genuinely
+  inconclusive, capped at one, and in one of two explicit modes: *review-only*
+  (cheap — worker B critiques A's diff) or *blind reimplementation* (expensive —
+  same prompt, fresh worktree, compare). Claude states which it's using.
+- **Two review lanes.** A small, well-scoped diff (≤ ~3 files / ~100 lines, only
+  the files it was told to touch, nothing security- or config-adjacent) gets a
+  diff-read plus verification. Full architectural review is reserved for bigger
+  or riskier diffs.
+- **No pre-reading.** Claude scopes and names paths rather than ingesting the
+  codebase to write a prompt — otherwise delegation saves nothing.
+- **Max 2 correction cycles** per task. Only worker round-trips count against
+  it; Claude's own small fixes are free.
+- **No Claude subagents** layered on a delegated task — the worker already is one.
+- **Serial on multi-task requests** — one worktree/review/merge at a time.
+- Trivial requests bypass the pipeline entirely.
 
-## 8. Git/worktree behavior
+## 7. Git/worktree behavior
 
 `new-worktree.sh <repo-root> <agent-name>` creates
-`~/.swarm/worktrees/<repo-name>/<agent>-<timestamp>` on a new
-`swarm/<agent>-<timestamp>` branch, based on the repo's current `HEAD` (or a ref
-you pass as a 3rd arg). Once a worktree's diff passes review, Claude commits it
-itself with a plain commit message — no `Co-Authored-By` trailer, no mention of
-Claude/Cursor/CommandCode — so the commit shows up as yours, using this
-machine's normal git identity. Claude then merges (`git merge --no-ff`) into
-your branch and runs `cleanup-worktree.sh <repo-root> <worktree-dir>`, which
-removes the worktree and deletes its branch. Claude will never push or open a
-PR on its own — if a task needs that, it stops and hands you the exact command.
+`~/.swarm/worktrees/<repo>/<agent>-<timestamp>` on a `swarm/<agent>-<timestamp>`
+branch from current `HEAD` (or a ref passed as a 3rd arg). After review passes,
+Claude commits inside the worktree with a plain message — no `Co-Authored-By`
+trailer, no mention of Claude/Cursor/CommandCode — so it lands under your normal
+git identity, then merges with `git merge --no-ff` and runs
+`cleanup-worktree.sh`, which removes the worktree and deletes its branch.
 
-If the current directory isn't a git repo, worktree isolation is skipped —
-Claude will say so and either work directly or suggest `git init`.
+Merge conflicts: Claude resolves only trivially obvious ones (imports, adjacent
+additions) and otherwise aborts and shows you the hunks. To undo an integrated
+merge: `git revert -m 1 <merge-sha>`. Claude never pushes or opens a PR on its
+own — it hands you the command.
 
-## 9. How to start/use the system
+**Non-git directories**: worktree isolation is unavailable, which means an
+auto-approving worker mutating an unversioned tree with no undo. Claude will stop
+and recommend `git init`, and only proceed if you explicitly say so.
 
-Nothing to "start" — it's a Claude Code skill, available in any repo once
-`~/.claude/skills/swarm/` exists. Trigger it by:
-- asking Claude to build/implement/refactor something non-trivial, or
-- explicitly saying "use the swarm" / "delegate this to Cursor" / "use
-  commandcode for this", or
-- invoking `/swarm <task>` directly.
+## 8. Prompt-injection surface
 
-Claude decides internally when it's worth invoking, and which single worker to
-use — trivial asks are handled directly without ceremony.
+Workers run with auto-approve. A malicious or compromised file in the repo can
+steer one. The worktree contains *file* damage — it does not contain network or
+environment access. Claude is instructed never to put secrets or tokens into a
+task prompt file. Treat untrusted repos accordingly.
 
-## 10. How to troubleshoot it
+## 9. Using it
 
-- **Cursor step fails immediately** — check `cursor-agent status` (should show
-  "Logged in as ..."). Re-auth with `cursor-agent login`.
-- **`cursor-agent: command not found`** — it's not the same binary as `cursor`
-  (that's the editor). Install it with `curl https://cursor.com/install -fsS | bash`.
-- **CommandCode step fails or behaves oddly** — check `commandcode status`
-  (should show "Authenticated as ..."). Re-auth with `commandcode login`.
-- **CommandCode step is slow or flaky** — `poolside/laguna-s-2.1-free` is a
-  free-tier model; that comes with variable latency/availability. Switch to a
-  paid model on your account with `COMMANDCODE_SWARM_MODEL=<model-id>` (see
-  §5) if it becomes a recurring problem.
-- **Stale worktrees piling up** — list them with
-  `git -C <repo> worktree list`, remove any orphaned ones with
-  `scripts/cleanup-worktree.sh <repo> <path>`.
-- **A commit shows tool attribution you didn't want** — that would be a bug in
-  how Claude wrote the commit message per [SKILL.md](SKILL.md) §7; flag it so
-  the instruction can be sharpened.
+Nothing to start — it's a skill, live in any repo once `~/.claude/skills/swarm/`
+exists. Trigger it by asking Claude to build/implement/refactor something
+non-trivial, by saying "use the swarm" / "delegate this to Cursor", or with
+`/swarm <task>`. Claude triages internally; trivial asks are handled directly.
 
-## 11. How to disable the automation
+During a run you'll see one status line per transition:
+
+```
+[Claude]  Preflight — main, tree clean, baseline pass
+[Claude]  Planning — add retry wrapper to api client, delegating to Cursor
+[Cursor]  Working — cycle 1/2
+[Cursor]  Complete — exit 0, 2 files changed
+[Claude]  Review — fast lane
+[Claude]  PASS
+[Claude]  Merged swarm/cursor-20260907-141302 → main
+```
+
+## 10. Troubleshooting
+
+- **Cursor step fails immediately** — `cursor-agent status` should show "Logged
+  in as ...". Re-auth with `cursor-agent login`.
+- **`cursor-agent: command not found`** — different binary from `cursor` (the
+  editor). Install: `curl https://cursor.com/install -fsS | bash`.
+- **CommandCode fails or behaves oddly** — `commandcode status` should show
+  "Authenticated as ...". Re-auth with `commandcode login`.
+- **CommandCode is slow or flaky** — its default here is a free-tier model, with
+  the variable latency/availability that implies. Switch with
+  `COMMANDCODE_SWARM_MODEL=<id>` (§4).
+- **A run hangs** — it can't; the wrappers time out at `SWARM_TASK_TIMEOUT`
+  (default 900s) and exit 124. Raise it for genuinely long tasks.
+- **Worker reported success but nothing changed** — an empty diff is never a
+  PASS; it usually means the worker ran in the wrong directory. Claude is
+  instructed to catch this, so flag it if one slips through.
+- **Stale worktrees piling up** — `git -C <repo> worktree list`, then
+  `scripts/cleanup-worktree.sh <repo> <path>` on orphans. `preflight.sh` also
+  counts them.
+- **A commit shows tool attribution you didn't want** — that's a bug against
+  [SKILL.md](SKILL.md) §9; flag it so the instruction can be sharpened.
+
+## 11. Disabling it
 
 Delete or rename `~/.claude/skills/swarm/` (or just its `SKILL.md`) — without a
-`SKILL.md`, Claude Code won't discover or trigger it. Nothing else on the system
-depends on it; the wrapper scripts don't run on their own.
+`SKILL.md`, Claude Code won't discover it. Nothing else depends on it; the
+wrapper scripts never run on their own.
 
-## 12. How to modify the orchestration rules
+## 12. Modifying the rules
 
-Everything behavioral — the triage rules, the approval-gate list, the
-worker-selection logic, the review lanes and classifications (PASS/MINOR
-FIX/MAJOR FIX/ARCHITECTURAL ISSUE/NEEDS HUMAN DECISION), the loop limits, and
-the commit/integration rules — lives in [SKILL.md](SKILL.md) as plain
-instructions Claude reads and follows. Edit that file directly; no code
-changes needed. Model choices are pulled out into script env vars
-(`CURSOR_SWARM_MODEL`, `COMMANDCODE_SWARM_MODEL`) for quick overriding without
-editing the protocol itself.
+Everything behavioral — triage, approval gates, worker selection, review lanes
+and classifications, failure protocol, budgets, commit/integration rules — is
+plain instructions in [SKILL.md](SKILL.md). Edit it directly; no code changes
+needed. Mechanical concerns (timeouts, model IDs, worktree paths, preflight
+checks) live in `scripts/` so the protocol file stays short — it's loaded into
+context every time the skill fires, so brevity there is a real cost saving.
 
 ## Note on CommandCode's own "taste" learning
 
-CommandCode maintains its own project-local preference file
-(`<repo>/.commandcode/taste/taste.md`) that it reads and updates automatically
-based on how you work with it directly — this is separate from and unrelated
-to the swarm skill's own rules in `SKILL.md`, and needs no wiring from this
-skill; CommandCode picks it up on its own whenever it runs in that repo.
+CommandCode maintains a project-local preference file
+(`<repo>/.commandcode/taste/taste.md`) that it reads and updates based on how you
+work with it directly. That's separate from this skill's rules and needs no
+wiring — CommandCode picks it up on its own whenever it runs in that repo.
