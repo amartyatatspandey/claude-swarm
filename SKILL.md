@@ -23,6 +23,18 @@ Two standing efficiency rules:
   ingestion — find the entry points and conventions, name the paths, and let the
   worker do the reading. Reading twenty files to write a delegation prompt spends
   exactly what delegating was meant to save.
+- **Scope and judge blast radius with `codebase-memory-mcp`, not by reading
+  files.** It's already configured as this environment's first-resort code
+  discovery tool — use it here too, for the same reason: a graph query returns
+  the relevant slice instead of a pile of source you then have to read anyway.
+  Concretely: `search_graph` / `get_architecture` to find the entry points and
+  conventions for §2 instead of grepping; `trace_path(mode=calls)` on the
+  worker's changed symbols to compute actual blast radius for the §7 lane
+  decision instead of eyeballing file count. If the target project isn't
+  indexed yet, run `index_repository` once before this task — that's a one-time
+  setup cost outside the per-task budget, not something to redo each time. If
+  the index is stale or the tool errors, fall back to Grep/Read rather than
+  blocking on it.
 
 ## Status lines — the only output you print during a run
 
@@ -76,7 +88,9 @@ Without this you will burn correction cycles on damage the worker didn't do.
 
 ## 2. Plan and pick ONE worker
 
-1. Scope the change: relevant files, existing conventions, what tests cover it.
+1. Scope the change: relevant files, existing conventions, what tests cover it —
+   via `codebase-memory-mcp` (`search_graph`, `get_architecture`, `trace_path`)
+   rather than reading files by hand. See the graph-first rule above.
 2. Pick the worker:
    - **Default: Cursor.** Use it unless there's a specific reason not to.
    - **CommandCode** when Cursor is missing/failing/rate-limited, or the user
@@ -176,6 +190,13 @@ contained. Most delegated tasks should land here.
 **Full lane** — anything else, or when the fast-lane read left you uncertain.
 Also check architecture fit, error handling, edge cases, and security
 implications, then verify.
+
+Use `trace_path(mode=calls)` from `codebase-memory-mcp` on the changed
+symbols to get the *actual* blast radius — callers, dependents, tests — rather
+than eyeballing file count. A diff that touches one file but that one file has
+a wide blast radius belongs in the full lane even though it'd pass the file-count
+bar; a diff touching a few files with a narrow, contained blast radius can stay
+fast-laned. This replaces guessing "does this look risky" with a real answer.
 
 **Verification runs inside the worktree**, not your shell's cwd:
 `cd <worktree> && <command>` (or `git -C`). Compare results against the baseline

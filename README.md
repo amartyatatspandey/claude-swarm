@@ -112,7 +112,26 @@ opening a PR, running at all in a **non-git directory**, or a task that's alread
 burned 2 correction cycles. Exact wording is [SKILL.md](SKILL.md) §3 — edit that
 to change the gate.
 
-## 6. Token/cost safeguards
+## 6. Graph-based scoping (`codebase-memory-mcp`)
+
+Where it's available (this environment has it configured and set as the
+first-resort code discovery tool), Claude scopes tasks and judges review risk
+via graph queries instead of reading files by hand:
+
+- **§2 scoping** — `search_graph` / `get_architecture` to find entry points and
+  conventions, instead of grepping around before writing the task prompt.
+- **§7 review lane** — `trace_path(mode=calls)` on the changed symbols to get the
+  diff's real blast radius (callers, dependents, tests) rather than approximating
+  risk from file count. A one-file diff with a wide blast radius gets the full
+  lane; a few-file diff with a narrow one can still fast-lane.
+
+If the target repo isn't indexed yet, that's a one-time `index_repository` cost
+outside any task's budget — not repeated per delegation. If the tool errors or
+the index is stale, Claude falls back to Grep/Read rather than blocking on it.
+This isn't a hard dependency of the skill — without it, Claude just falls back
+to reading files directly, same as before.
+
+## 7. Token/cost safeguards
 
 - **One worker by default.** A second is brought in only when review is genuinely
   inconclusive, capped at one, and in one of two explicit modes: *review-only*
@@ -130,7 +149,7 @@ to change the gate.
 - **Serial on multi-task requests** — one worktree/review/merge at a time.
 - Trivial requests bypass the pipeline entirely.
 
-## 7. Git/worktree behavior
+## 8. Git/worktree behavior
 
 `new-worktree.sh <repo-root> <agent-name>` creates
 `~/.swarm/worktrees/<repo>/<agent>-<timestamp>` on a `swarm/<agent>-<timestamp>`
@@ -149,14 +168,14 @@ own — it hands you the command.
 auto-approving worker mutating an unversioned tree with no undo. Claude will stop
 and recommend `git init`, and only proceed if you explicitly say so.
 
-## 8. Prompt-injection surface
+## 9. Prompt-injection surface
 
 Workers run with auto-approve. A malicious or compromised file in the repo can
 steer one. The worktree contains *file* damage — it does not contain network or
 environment access. Claude is instructed never to put secrets or tokens into a
 task prompt file. Treat untrusted repos accordingly.
 
-## 9. Using it
+## 10. Using it
 
 Nothing to start — it's a skill, live in any repo once `~/.claude/skills/swarm/`
 exists. Trigger it by asking Claude to build/implement/refactor something
@@ -175,7 +194,7 @@ During a run you'll see one status line per transition:
 [Claude]  Merged swarm/cursor-20260907-141302 → main
 ```
 
-## 10. Troubleshooting
+## 11. Troubleshooting
 
 - **Cursor step fails immediately** — `cursor-agent status` should show "Logged
   in as ...". Re-auth with `cursor-agent login`.
@@ -197,13 +216,13 @@ During a run you'll see one status line per transition:
 - **A commit shows tool attribution you didn't want** — that's a bug against
   [SKILL.md](SKILL.md) §9; flag it so the instruction can be sharpened.
 
-## 11. Disabling it
+## 12. Disabling it
 
 Delete or rename `~/.claude/skills/swarm/` (or just its `SKILL.md`) — without a
 `SKILL.md`, Claude Code won't discover it. Nothing else depends on it; the
 wrapper scripts never run on their own.
 
-## 12. Modifying the rules
+## 13. Modifying the rules
 
 Everything behavioral — triage, approval gates, worker selection, review lanes
 and classifications, failure protocol, budgets, commit/integration rules — is
