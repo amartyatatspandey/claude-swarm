@@ -6,6 +6,14 @@ the fallback for when Cursor is missing, failing, or you explicitly ask for it.
 One worker per task — this is deliberately not a parallel-everything setup.
 Works in any repo; it's installed globally.
 
+This repo's root is the **Claude Code** skill — copy its contents (`SKILL.md`,
+`README.md`, `scripts/`, `templates/`) to `~/.claude/skills/swarm/` to install it.
+There's also a **Cursor-orchestrated counterpart** in [`cursor/`](cursor/) — same
+idea, Cursor is the senior engineer instead of Claude, workers are CommandCode /
+OpenCode / a cheaper Cursor tier. Copy `cursor/`'s contents to
+`~/.cursor/skills/swarm/` to install that one. They're independent — install
+either, both, or neither.
+
 ## 1. Architecture
 
 ```
@@ -101,8 +109,14 @@ see troubleshooting.
 ## 5. Approval gates
 
 Claude proceeds on its own for: preflight and inspection, running
-tests/lint/type checks, delegating reasonably-scoped tasks, reviewing worker
-output, small fixes, iterative debugging, and merging a passing worktree locally.
+tests/lint/type checks, reviewing worker output, small fixes, iterative
+debugging, and merging a passing worktree locally.
+
+**Worker choice is always confirmed, never assumed** — one mandatory numbered
+question per task, skipped only when the user's request already named a
+worker. This isn't a high-risk STOP gate (it doesn't block on approval the way
+§3 does); it's a standing question asked every time, autonomously answered by
+the user in the same turn. See [SKILL.md](SKILL.md) §2.
 
 Claude stops and asks first for: large refactors, architectural changes, DB
 migrations, deleting substantial code, **breaking** public API changes (adding to

@@ -91,11 +91,18 @@ Without this you will burn correction cycles on damage the worker didn't do.
 1. Scope the change: relevant files, existing conventions, what tests cover it —
    via `codebase-memory-mcp` (`search_graph`, `get_architecture`, `trace_path`)
    rather than reading files by hand. See the graph-first rule above.
-2. Pick the worker:
-   - **Default: Cursor.** Use it unless there's a specific reason not to.
-   - **CommandCode** when Cursor is missing/failing/rate-limited, or the user
-     names it. It's the fallback, not a co-equal.
-   - If the task is faster to just do than to write a spec for, do it yourself.
+2. **Pick the worker — ask, don't assume.** Unless the user's own request already
+   named one (e.g. "use CommandCode", "delegate to Cursor"), you must ask before
+   delegating. Present a numbered list and wait for the answer:
+   ```
+   Which worker should implement this?
+   1. Cursor — default, general-purpose
+   2. CommandCode — fallback; use if Cursor is missing/failing/rate-limited
+   ```
+   Skip the question only when the request already specifies the worker — then
+   proceed straight to delegation with that one. This is separate from §0's
+   trivial-task bypass: "do it yourself" is a triage decision made before this
+   step, not one of the numbered options.
 3. Print the `[Claude] Planning` line.
 
 ## 3. STOP and ask the user before proceeding, if the task involves:
